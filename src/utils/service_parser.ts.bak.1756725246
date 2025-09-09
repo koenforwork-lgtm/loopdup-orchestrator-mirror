@@ -1,0 +1,364 @@
+// packages/orchestrator/src/utils/service_parser.ts
+// Tiny regex-based extractors for booking flow slot filling.
+// NOTE: This file must not import itself (no imports here).
+
+/* ------------------------------ Guests ---------------------------------- */
+
+export function parseGuests(text: string): number | null {
+  const m = text.match(/(\d+)\s*(people|persons|guests|pax)?\b/i);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+/* ------------------------------- Time ----------------------------------- */
+
+/**
+ * Accepts 12h ("3", "3 pm", "03:00pm") and 24h ("15:30").
+ * Returns the matched raw time string (to preserve what user typed).
+ */
+export function parseTime(text: string): string | null {
+  // e.g. "7", "7pm", "7 pm", "07:30", "19:00", "03:00am"
+  const m = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i);
+  return m ? m[0] : null;
+}
+
+/** Return true when time is 1..12 with no am/pm (ambiguous). */
+export function isAmbiguousTime(raw: string): boolean {
+  const m = raw.trim().match(/^(\d{1,2})(?::(\d{2}))?$/); // no am/pm present
+  if (!m) return false;
+  const h = parseInt(m[1], 10);
+  return h >= 1 && h <= 12; // 1..12 without am/pm = ambiguous
+}
+
+/** Pretty-print any time to 12h with am/pm. Keeps minutes if present. */
+export function prettyTime(raw: string): string {
+  const s = raw.trim().toLowerCase();
+
+  // already 12h with am/pm
+  let m = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$/i);
+  if (m) {
+    let h = parseInt(m[1], 10);
+    const mins = m[2] ? m[2] : '00';
+    const ap = m[3].toLowerCase();
+    if (h === 0) h = 12;
+    if (h > 12) h = h % 12;
+    return `${h}:${mins} ${ap}`;
+  }
+
+  // 24h forms: 0..23[:mm]
+  m = s.match(/^(\d{1,2})(?::(\d{2}))$/);
+  if (m) {
+    let h = parseInt(m[1], 10);
+    const mins = m[2] ?? '00';
+    if (h === 0) return `12:${mins} am`;
+    if (h === 12) return `12:${mins} pm`;
+    if (h > 12) return `${h - 12}:${mins} pm`;
+    // 1..12 without am/pm: keep as-is (ambiguous)
+    return `${h}:${mins}`;
+  }
+
+  // bare hour (e.g., "3")
+  const bare = s.match(/^(\d{1,2})$/);
+  if (bare) {
+    const h = parseInt(bare[1], 10);
+    if (h === 0) return `12:00 am`;
+    if (h > 12) return `${h - 12}:00 pm`;
+    return `${h}:00`; // ambiguous
+  }
+
+  return raw; // fallback
+}
+
+/* ------------------------------- Date ----------------------------------- */
+
+const MONTHS = [
+  'January','February','March','April','May','June',
+  'July','August','September','October','November','December'
+];
+const WEEKDAYS = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+
+function pad2(n: number) { return n < 10 ? `0${n}` : `${n}`; }
+function fmtDate(d: Date) { return `${pad2(d.getDate())} ${MONTHS[d.getMonth()]}`; }
+function today(): Date { const d = new Date(); d.setHours(0,0,0,0); return d; }
+function addDays(d: Date, days: number) { const x = new Date(d); x.setDate(x.getDate() + days); return x; }
+
+/** Levenshtein distance (tiny, for fuzzy weekday matching). */
+function lev(a: string, b: string): number {
+  const m = a.length, n = b.length;
+  const dp = Array.from({ length: m + 1 }, (_, i) => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost
+      );
+    }
+  }
+  return dp[m][n];
+}
+
+function fuzzyWeekday(word: string): number | null {
+  const w = word.toLowerCase();
+  let bestIdx = -1, bestDist = Infinity;
+  for (let i = 0; i < WEEKDAYS.length; i++) {
+    const dist = lev(w, WEEKDAYS[i]);
+    if (dist < bestDist) { bestDist = dist; bestIdx = i; }
+  }
+  // accept small typos (e.g., "tuesdau") within distance 2
+  return bestDist <= 2 ? bestIdx : null;
+}
+
+/**
+ * Next occurrence of weekday (allowing "today" if it’s the same weekday).
+ * NOTE: kept for backward compatibility with your existing logic.
+ */
+function nextWeekday(targetDow: number): Date {
+  const t = today();
+  const diff = (targetDow - t.getDay() + 7) % 7;
+  return addDays(t, diff === 0 ? 0 : diff);
+}
+
+/**
+ * Parse dates from casual phrases:
+ * - "today", "tomorrow"
+ * - Weekday names with small typos ("tuesday", "tuesdau") → next occurrence
+ * - Numeric "1/9", "01-09" (DD/MM by default)
+ * - "1 sep", "01 september"
+ * Returns formatted "DD Month" or null if not recognized.
+ */
+export function parseDate(text: string): string | null {
+  const s = text.trim().toLowerCase();
+
+  // today / tomorrow
+  if (/\btoday\b/.test(s)) return fmtDate(today());
+  if (/\btomorrow\b/.test(s)) return fmtDate(addDays(today(), 1));
+
+  // weekday (exact or fuzzy)
+  const weekdayMatch = s.match(/\b([a-z]+)\b/);
+  if (weekdayMatch) {
+    const idx = fuzzyWeekday(weekdayMatch[1]);
+    if (idx !== null) return fmtDate(nextWeekday(idx));
+  }
+
+  // numeric date: dd/mm or dd-mm (assume current year)
+  let m = s.match(/\b(\d{1,2})[\/\-\.](\d{1,2})(?:[\/\-\.](\d{2,4}))?\b/);
+  if (m) {
+    const dd = parseInt(m[1], 10);
+    const mm = parseInt(m[2], 10);
+    if (dd >= 1 && dd <= 31 && mm >= 1 && mm <= 12) {
+      const now = today();
+      const year = m[3] ? (parseInt(m[3], 10) < 100 ? 2000 + parseInt(m[3], 10) : parseInt(m[3], 10)) : now.getFullYear();
+      const d = new Date(year, mm - 1, dd);
+      return isNaN(d.getTime()) ? null : fmtDate(d);
+    }
+  }
+
+  // "1 sep" / "01 september"
+  m = s.match(/\b(\d{1,2})\s*([a-z]{3,})\b/);
+  if (m) {
+    const dd = parseInt(m[1], 10);
+    const monWord = m[2].toLowerCase();
+    let monIdx = -1;
+    for (let i = 0; i < MONTHS.length; i++) {
+      const full = MONTHS[i].toLowerCase();
+      if (full.startsWith(monWord) || lev(monWord, full) <= 2) { monIdx = i; break; }
+    }
+    if (monIdx >= 0 && dd >= 1 && dd <= 31) {
+      const now = today();
+      const d = new Date(now.getFullYear(), monIdx, dd);
+      return isNaN(d.getTime()) ? null : fmtDate(d);
+    }
+  }
+
+  return null;
+}
+
+/* ------------------------------- Name ----------------------------------- */
+
+export function parseName(text: string): string | null {
+  // very simple: single token alphabetic name
+  const parts = text.trim().split(/\s+/);
+  if (parts.length === 1 && /^[a-z]+(?:'[a-z]+)?$/i.test(parts[0])) return parts[0];
+  return null;
+}
+
+/* -------- NEW: ISO date & strict weekday resolver (non-breaking) -------- */
+
+/**
+ * Always returns the *next* occurrence (never today) of the given weekday as ISO (YYYY-MM-DD).
+ * @example nextWeekdayISO("wednesday") -> "2025-09-03"
+ */
+export function nextWeekdayISO(weekdayName: string, base: Date = new Date()): string {
+  const want = WEEKDAYS.indexOf(weekdayName.toLowerCase());
+  if (want < 0) throw new Error(`Unknown weekday: ${weekdayName}`);
+  const d = new Date(base);
+  d.setHours(0, 0, 0, 0);
+  const diff = (want - d.getDay() + 7) % 7;
+  const add = diff === 0 ? 7 : diff; // always the NEXT one
+  d.setDate(d.getDate() + add);
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Normalize common date inputs to ISO (YYYY-MM-DD).
+ * Supports: today, tomorrow, weekdays (with small typos), YYYY-MM-DD, DD/MM[/YY], DD-MM, "1 sep".
+ */
+export function normalizeDateToISO(text: string, base: Date = today()): string | null {
+  if (!text) return null;
+  const s = text.trim().toLowerCase();
+
+  if (/\btoday\b/.test(s)) return base.toISOString().slice(0, 10);
+  if (/\btomorrow\b/.test(s)) return addDays(base, 1).toISOString().slice(0, 10);
+
+  // YYYY-MM-DD
+  let m = s.match(/\b(20\d{2})-(0?[1-9]|1[0-2])-(0?[1-9]|[12]\d|3[01])\b/);
+  if (m) {
+    const y = parseInt(m[1], 10);
+    const mo = parseInt(m[2], 10);
+    const dd = parseInt(m[3], 10);
+    const d = new Date(y, mo - 1, dd);
+    if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+  }
+
+  // DD/MM or DD-MM or DD.MM (assume current year if missing)
+  m = s.match(/\b(\d{1,2})[\/\-\.](\d{1,2})(?:[\/\-\.](\d{2,4}))?\b/);
+  if (m) {
+    const dd = parseInt(m[1], 10);
+    const mm = parseInt(m[2], 10);
+    const y = m[3] ? (parseInt(m[3], 10) < 100 ? 2000 + parseInt(m[3], 10) : parseInt(m[3], 10)) : base.getFullYear();
+    const d = new Date(y, mm - 1, dd);
+    if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+  }
+
+  // "1 sep" / "01 september"
+  m = s.match(/\b(\d{1,2})\s*([a-z]{3,})\b/);
+  if (m) {
+    const dd = parseInt(m[1], 10);
+    const monWord = m[2].toLowerCase();
+    let monIdx = -1;
+    for (let i = 0; i < MONTHS.length; i++) {
+      const full = MONTHS[i].toLowerCase();
+      if (full.startsWith(monWord) || lev(monWord, full) <= 2) { monIdx = i; break; }
+    }
+    if (monIdx >= 0 && dd >= 1 && dd <= 31) {
+      const d = new Date(base.getFullYear(), monIdx, dd);
+      if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+    }
+  }
+
+  // weekday (exact or fuzzy)
+  const wd = s.match(/\b([a-z]+)\b/);
+  if (wd) {
+    const idx = fuzzyWeekday(wd[1]);
+    if (idx !== null) return nextWeekdayISO(WEEKDAYS[idx], base);
+  }
+
+  return null;
+}
+
+/** True if we cannot confidently understand the provided date text. */
+export function isDateUnclear(text: string): boolean {
+  if (!text) return true;
+  const iso = normalizeDateToISO(text);
+  return !iso;
+}
+
+/**
+ * Normalize time to 24h "HH:MM".
+ * Returns null if ambiguous (e.g., "7" without am/pm) or unparseable.
+ */
+export function normalizeTime(text: string): string | null {
+  if (!text) return null;
+  const s = text.trim().toLowerCase();
+
+  // 12h with am/pm
+  let m = s.match(/\b([1-9]|1[0-2])(?:\:([0-5]\d))?\s?(am|pm)\b/);
+  if (m) {
+    let h = parseInt(m[1], 10);
+    const mins = m[2] ?? '00';
+    const ap = m[3];
+    if (ap === 'pm' && h !== 12) h += 12;
+    if (ap === 'am' && h === 12) h = 0;
+    return `${String(h).padStart(2, '0')}:${mins}`;
+  }
+
+  // 24h like 19:00
+  m = s.match(/\b([0-1]?\d|2[0-3])\:([0-5]\d)\b/);
+  if (m) {
+    const h = m[1].padStart(2, '0');
+    const mins = m[2];
+    return `${h}:${mins}`;
+  }
+
+  // Bare hour (ambiguous)
+  if (/\b([0-1]?\d|2[0-3])\b/.test(s) && !/\b(am|pm)\b/.test(s)) {
+    return null;
+  }
+
+  return null;
+}
+
+/** Convenience wrapper mirroring your naming: unclear if parseTime yields ambiguous hour. */
+export function isTimeUnclear(text: string): boolean {
+  const raw = parseTime(text);
+  if (!raw) return true;
+  return isAmbiguousTime(raw);
+}
+
+/* --------------------------- NEW: prettyDate ----------------------------- */
+
+/**
+ * Pretty-print a date string to "DD Month".
+ * - If input is ISO (YYYY-MM-DD) or any supported natural form, converts to "DD Month".
+ * - Otherwise returns the input unchanged.
+ */
+export function prettyDate(input: string): string {
+  if (!input) return input;
+  // direct ISO
+  const iso = /^\d{4}-\d{2}-\d{2}$/.test(input) ? input : (normalizeDateToISO(input) ?? null);
+  if (iso) {
+    const [y, m, d] = iso.split('-').map(Number);
+    const dt = new Date(y, m - 1, d);
+    if (!isNaN(dt.getTime())) return fmtDate(dt);
+  }
+  // fall back to existing natural pretty form if parseDate can do it
+  const pretty = parseDate(input);
+  return pretty ?? input;
+}
+/** True if we cannot confidently understand the provided date text. */
+export function isDateUnclear(text: string): boolean {
+  if (!text) return true;
+  const s = text.trim();
+  // Accept ISO directly
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  // Accept anything our parseDate can understand (e.g., "today", "tomorrow", "1 September", weekdays)
+  return parseDate(s) === null;
+}
+
+/**
+ * Pretty-print a date string to "DD Month".
+ * - If input is ISO (YYYY-MM-DD), converts to "DD Month".
+ * - Else, if parseDate understands it, reuse that pretty form.
+ * - Otherwise, return the input unchanged.
+ */
+export function prettyDate(input: string): string {
+  if (!input) return input;
+  const s = input.trim();
+
+  // ISO → "DD Month"
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const [y, m, d] = s.split('-').map(Number);
+    const dt = new Date(y, m - 1, d);
+    // reuse your internal fmtDate helper
+    // (fmtDate is already declared above in this file)
+    // @ts-ignore – using local helper
+    return isNaN(dt.getTime()) ? input : fmtDate(dt);
+  }
+
+  // Natural forms via your existing parser
+  const pretty = parseDate(s);
+  return pretty ?? input;
+}

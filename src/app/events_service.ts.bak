@@ -1,0 +1,38 @@
+import type { InboundEvent } from "../middleware/validateEvent";
+import { decide } from "./decision_engine";
+import { postBotReplyToChatwoot, escalateToChatwoot, getChatwootConfig } from "../adapters/chatwoot_adapter";
+
+export async function handleInboundEvent(event: InboundEvent) {
+  const decision = await decide(event);
+
+  const shouldEscalate =
+    decision.intent === "SERVICE" ||
+    decision.intent === "UNKNOWN" ||
+    decision.sentiment === "neg" ||
+    (decision.intent === "FAQ" && decision.lowConfidence);
+
+  if (shouldEscalate) {
+    await escalateToChatwoot({
+      propertyId: event.propertyId,
+      conversationId: event.conversationId,
+      guestId: event.guestId || event.conversationId,
+      text: event.text,
+      lang: event.lang,
+      getConfig: getChatwootConfig
+    });
+    return { action: "ESCALATE", intent: decision.intent, sentiment: decision.sentiment ?? null };
+  }
+
+  const reply = decision.answer || "Thanks!";
+  // TODO: send reply back to channel here if you already have a channel adapter.
+
+  await postBotReplyToChatwoot({
+    propertyId: event.propertyId,
+    conversationId: event.conversationId,
+    guestId: event.guestId || event.conversationId,
+    text: reply,
+    getConfig: getChatwootConfig
+  });
+
+  return { action: "REPLY", intent: decision.intent, method: decision.method ?? null };
+}

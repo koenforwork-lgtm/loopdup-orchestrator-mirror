@@ -1,0 +1,115 @@
+// src/app/intent_router.ts
+import { pauseGate } from '../middleware/pauseGate';
+import { handleSoftEscalation, handleHardPause } from '../handlers/escalation_handler';
+import { replyFromBot } from '../adapters/chatwoot_adapter';
+import { getState, incrementClarify, incrementNegative } from '../repos/conv_state_repo';
+
+type IntentResult = {
+  intent: 'FAQ' | 'SERVICE' | 'CHITCHAT' | 'UNKNOWN';
+  confidence?: number;
+  negative?: boolean;
+};
+
+const DEFAULTS = {
+  faq_conf_threshold: 0.78,
+  max_clarify_attempts: 2,
+  negative_repeat_threshold: 2,
+  auto_resume_minutes: 30,
+  escalate_keywords: ['human','agent','staff','manager','real person'],
+  chitchat_enabled: true,
+};
+
+function containsEscalateKeyword(t: string, list: string[]) {
+  const s = (t || '').toLowerCase();
+  return list.some(k => s.includes(k.toLowerCase()));
+}
+
+export async function intentRouter(
+  event: any,
+  decide: (e:any)=>Promise<IntentResult>,
+  settings?: any
+) {
+  const opts = { ...DEFAULTS, ...(settings||{}) };
+  const { propertyId, conversationId, text = '' } = event;
+
+  // Hard pause guard
+  const gate = await pauseGate(propertyId, conversationId);
+  if (gate.blocked) return { skipped: true, reason: 'paused' };
+
+  const state = await getState(propertyId, conversationId);
+  const result = await decide(event);
+  const { intent, confidence=0, negative=false } = result;
+
+  const inWatch = !!state?.watch_mode;
+  const prevClarify = state?.clarify_attempts ?? 0;
+  const nextClarify = prevClarify + 1;
+
+  // Guest explicitly asks for human -> SOFT ESCALATE, keep bot active
+  if (containsEscalateKeyword(text, opts.escalate_keywords)) {
+    await handleSoftEscalation(event, false);
+    if (prevClarify === 0) {
+      await replyFromBot(
+        conversationId,
+        "I’ve alerted a teammate to help you directly. In the meantime, is there anything else I can help with?"
+      );
+    }
+    return { escalated: true, mode: 'soft_watch', reason: 'keyword_request_human' };
+  }
+
+  // SERVICE / NEGATIVE => soft escalate + triage; hard pause on repeated negative
+  if (intent === 'SERVICE' || negative) {
+    await handleSoftEscalation(event, false);
+    if (negative) await incrementNegative(propertyId, conversationId);
+
+    await replyFromBot(
+      conversationId,
+      "I’m sorry about this. I’m alerting a teammate now. Could you share your room/table and a brief description? I’ll keep helping while they join."
+    );
+
+    if ((state?.negative_count ?? 0) + (negative ? 1 : 0) >= opts.negative_repeat_threshold) {
+      await handleHardPause(event, opts.auto_resume_minutes);
+      return { escalated: true, mode: 'hard_pause', reason: 'repeated_negative' };
+    }
+    return { escalated: true, mode: 'soft_watch', reason: 'service_or_negative' };
+  }
+
+  // CONFIDENT FAQ — answer even in watch mode
+  const isConfidentFAQ = intent === 'FAQ' && confidence >= opts.faq_conf_threshold;
+  if (isConfidentFAQ) {
+    return { ok: true, intent, confidence, todo: 'faq' }; // call your FAQ handler here in your project
+  }
+
+  // LOW-CONF FAQ / UNKNOWN / already in watch mode -> clarify loop
+  if (intent === 'UNKNOWN' || (intent === 'FAQ' && !isConfidentFAQ) || inWatch) {
+    await handleSoftEscalation(event, false);
+
+    if (prevClarify >= opts.max_clarify_attempts) {
+      if (prevClarify === opts.max_clarify_attempts) {
+        await replyFromBot(
+          conversationId,
+          "I’ve escalated this to a teammate. Meanwhile, is there anything else I can help you with?"
+        );
+      }
+      return { escalated: true, mode: 'soft_watch', reason: 'clarify_exhausted_soft' };
+    }
+
+    await incrementClarify(propertyId, conversationId);
+
+    const prompt = nextClarify === 1
+      ? "Just to be sure I’ve got you right — did you mean X? If it’s easier, you can rephrase and I’ll try again."
+      : "I might be off — could you share one extra detail (date/name/room)? I’ll help or loop a teammate in.";
+    await replyFromBot(conversationId, prompt);
+
+    return { escalated: true, mode: 'soft_watch', reason: 'clarify' };
+  }
+
+  // CHITCHAT
+  if (intent === 'CHITCHAT') {
+    if (opts.chitchat_enabled === false) return { skipped: true, reason: 'chitchat_disabled' };
+    await replyFromBot(conversationId, "Happy to chat! How can I help with your stay/visit?");
+    return { ok: true, intent };
+  }
+
+  // Fallthrough
+  return { ok: true, intent, confidence };
+}
